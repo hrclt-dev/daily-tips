@@ -1,0 +1,161 @@
+name: Affiliate Content Generator
+
+on:
+  schedule:
+    # 15:00 Europe/Budapest = 14:00 UTC in winter (CET = UTC+1)
+    - cron: '0 14 * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: write  # Needed to commit/push
+
+jobs:
+  generate-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Determine today's affiliate program
+        id: program
+        run: |
+          # Rotate deterministically: day of year % 10
+          DAY_OF_YEAR=$(date -u +%j)
+          INDEX=$(( (10#$DAY_OF_YEAR - 1) % 10 ))
+          
+          PROGRAMS=(
+            "ElevenLabs"
+            "InVideo AI"
+            "Systeme.io"
+            "Canva"
+            "Hostinger"
+            "NordVPN"
+            "Ledger"
+            "crypto.com"
+            "Binance"
+            "pump.fun"
+          )
+          
+          PROGRAM=${PROGRAMS[$INDEX]}
+          IS_CRYPTO=false
+          
+          case "$PROGRAM" in
+            "Ledger"|"crypto.com"|"Binance"|"pump.fun")
+              IS_CRYPTO=true
+              ;;
+          esac
+          
+          echo "program=$PROGRAM" >> $GITHUB_OUTPUT
+          echo "is_crypto=$IS_CRYPTO" >> $GITHUB_OUTPUT
+          echo "index=$INDEX" >> $GITHUB_OUTPUT
+          
+          echo "Today's program: $PROGRAM (index $INDEX, crypto: $IS_CRYPTO)"
+
+      - name: Generate affiliate post via OpenRouter
+        id: generate
+        run: |
+          PROGRAM="${{ steps.program.outputs.program }}"
+          IS_CRYPTO="${{ steps.program.outputs.is_crypto }}"
+          
+          PROMPT="Write ONE short, genuinely useful affiliate post (~280 chars) for $PROGRAM. 
+          Rules:
+          - End with placeholder footer: '🔗 [AFFILIATE LINK - REPLACE WITH REAL REFERRAL]'
+          - Include 1 relevant hashtag
+          - Voice: helpful builder, not salesy"
+          
+          if [ "$IS_CRYPTO" = "true" ]; then
+            PROMPT="$PROMPT
+            - For $PROGRAM (crypto): educational tone only, no financial advice, no hype
+            - Append '⚠️ Not financial advice.' at the end"
+          fi
+          
+          PROMPT="$PROMPT
+          Output ONLY the post text, no markdown, no extra commentary."
+          
+          RESPONSE=$(curl -s -X POST "https://openrouter.ai/api/v1/chat/completions" \
+            -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+              "messages": [{"role": "user", "content": "'"$PROMPT"'"}],
+              "max_tokens": 250,
+              "temperature": 0.7
+            }')
+          
+          POST=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          
+          if [ -z "$POST" ] || [ "$POST" = "null" ]; then
+            echo "Failed to generate post. Response: $RESPONSE"
+            exit 1
+          fi
+          
+          echo "post<<EOF" >> $GITHUB_OUTPUT
+          echo "$POST" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "Generated post: $POST"
+
+      - name: Create markdown file
+        id: create_file
+        run: |
+          DATE=$(date -u +'%Y-%m-%d')
+          FILE_PATH="daily/affiliate/${DATE}.md"
+          
+          mkdir -p daily/affiliate
+          
+          cat > "$FILE_PATH" <<EOF
+          ${DATE} - Affiliate: ${{ steps.program.outputs.program }}
+          
+          ${{ steps.generate.outputs.post }}
+          
+          ---
+          *Generated automatically via GitHub Actions + OpenRouter (Nemotron 3 Ultra)*
+          EOF
+          
+          echo "file_path=$FILE_PATH" >> $GITHUB_OUTPUT
+          echo "date=$DATE" >> $GITHUB_OUTPUT
+          
+          cat "$FILE_PATH"
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add ${{ steps.create_file.outputs.file_path }}
+          git commit -m "chore: affiliate post for ${{ steps.program.outputs.program }} (${{ steps.create_file.outputs.date }})" || echo "No changes to commit"
+          git push
+
+      - name: Log to Supabase
+        if: env.SUPABASE_URL != '' && env.SUPABASE_SERVICE_ROLE_KEY != ''
+        run: |
+          DATE="${{ steps.create_file.outputs.date }}"
+          POST="${{ steps.generate.outputs.post }}"
+          HASH=$(echo -n "$POST" | sha256sum | cut -d' ' -f1)
+          
+          curl -s -X POST "${SUPABASE_URL}/rest/v1/content_log" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=minimal" \
+            -d "{
+              \"body\": $(echo "$POST" | jq -Rs .),
+              \"posted_at\": \"${DATE}T14:00:00Z\",
+              \"hash\": \"$HASH\",
+              \"type\": \"affiliate\",
+              \"program\": \"${{ steps.program.outputs.program }}\"
+            }" || echo "Supabase logging failed (non-blocking)"

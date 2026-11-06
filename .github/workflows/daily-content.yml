@@ -1,0 +1,109 @@
+name: Daily Content Generator
+
+on:
+  schedule:
+    # 07:00 Europe/Budapest = 06:00 UTC in winter (CET = UTC+1)
+    - cron: '0 6 * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: write  # Needed to commit/push
+
+jobs:
+  generate-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate daily tip via OpenRouter
+        id: generate
+        run: |
+          PROMPT="Write ONE actionable tip for physical therapists building online income. Maximum 280 characters. Include exactly 1 relevant hashtag. Tone: helpful, practical, no fluff. Output ONLY the tip text, no markdown, no extra commentary."
+          
+          RESPONSE=$(curl -s -X POST "https://openrouter.ai/api/v1/chat/completions" \
+            -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+              "messages": [{"role": "user", "content": "'"$PROMPT"'"}],
+              "max_tokens": 200,
+              "temperature": 0.7
+            }')
+          
+          TIP=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          
+          if [ -z "$TIP" ] || [ "$TIP" = "null" ]; then
+            echo "Failed to generate tip. Response: $RESPONSE"
+            exit 1
+          fi
+          
+          echo "tip<<EOF" >> $GITHUB_OUTPUT
+          echo "$TIP" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "Generated tip: $TIP"
+
+      - name: Create markdown file
+        id: create_file
+        run: |
+          DATE=$(date -u +'%Y-%m-%d')
+          FILE_PATH="daily/${DATE}.md"
+          
+          mkdir -p daily
+          
+          cat > "$FILE_PATH" <<EOF
+          ${DATE}
+          
+          ${{ steps.generate.outputs.tip }}
+          
+          ---
+          *Generated automatically via GitHub Actions + OpenRouter (Nemotron 3 Ultra)*
+          EOF
+          
+          echo "file_path=$FILE_PATH" >> $GITHUB_OUTPUT
+          echo "date=$DATE" >> $GITHUB_OUTPUT
+          
+          cat "$FILE_PATH"
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add ${{ steps.create_file.outputs.file_path }}
+          git commit -m "chore: daily tip for ${{ steps.create_file.outputs.date }}" || echo "No changes to commit"
+          git push
+
+      - name: Log to Supabase
+        if: env.SUPABASE_URL != '' && env.SUPABASE_SERVICE_ROLE_KEY != ''
+        run: |
+          DATE="${{ steps.create_file.outputs.date }}"
+          TIP="${{ steps.generate.outputs.tip }}"
+          HASH=$(echo -n "$TIP" | sha256sum | cut -d' ' -f1)
+          
+          curl -s -X POST "${SUPABASE_URL}/rest/v1/content_log" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=minimal" \
+            -d "{
+              \"body\": $(echo "$TIP" | jq -Rs .),
+              \"posted_at\": \"${DATE}T06:00:00Z\",
+              \"hash\": \"$HASH\",
+              \"type\": \"daily-tip\"
+            }" || echo "Supabase logging failed (non-blocking)"
